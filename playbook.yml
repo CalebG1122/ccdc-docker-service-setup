@@ -1,0 +1,222 @@
+---
+# Deploys OpenCart (+ MariaDB) and BIND9 as Docker containers on Ubuntu 24.04.
+# Runs against the machine it's executed on:
+#   sudo apt install -y ansible
+#   ansible-playbook playbook.yml -K
+#
+# NOTE: "dh9" was assumed to mean BIND9 (DNS). Swap the bind9 service if you meant something else.
+
+- name: OpenCart + BIND9 in Docker
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    stack_dir: /opt/stack
+    domain: ccdc.local
+    host_ip: "192.168.56.101"             # the VM's host-only IP (hardcoded: the default route is usually the NAT adapter)
+    dns_bind_ip: "{{ host_ip }}"          # bind DNS to this IP only (avoids the systemd-resolved port 53 conflict)
+    zone_serial: 2026100901               # bump this whenever you edit the zone file
+
+    oc_version: "4.0.2.3"                 # check github.com/opencart/opencart/releases for newer
+    oc_port: 80                           # host port for the shop; if you change it, change oc_url too
+    oc_url: "http://{{ host_ip }}/"       # must end with / and match how you browse to the shop
+    oc_admin_user: admin
+    oc_admin_pass: "ChangeMe-Admin1"      # CHANGE ME
+    oc_admin_email: "admin@lab.test"
+
+    db_name: opencart_db
+    db_user: opencart_user
+    db_pass: "ChangeMe-Db1"               # CHANGE ME
+    db_root_pass: "ChangeMe-Root1"        # CHANGE ME
+
+  tasks:
+    # Distro packages keep this simple and repeatable. docker-compose-v2 is available on 24.04.
+    - name: Install Docker and Compose
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+        state: present
+        update_cache: true
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create project directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ stack_dir }}"
+        - "{{ stack_dir }}/opencart"
+        - "{{ stack_dir }}/bind"
+        - "{{ stack_dir }}/bind/zones"
+
+    # ---------- OpenCart image ----------
+    - name: Write OpenCart Dockerfile
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/opencart/Dockerfile"
+        mode: "0644"
+        content: |
+          FROM php:8.2-apache
+          ARG OC_VERSION={{ oc_version }}
+
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                libpng-dev libjpeg-dev libfreetype6-dev libzip-dev unzip curl \
+              && docker-php-ext-configure gd --with-freetype --with-jpeg \
+              && docker-php-ext-install -j"$(nproc)" gd mysqli zip \
+              && a2enmod rewrite \
+              && rm -rf /var/lib/apt/lists/*
+
+          # Download the official release and copy its "upload" dir into the web root
+          RUN curl -fsSL -o /tmp/oc.zip \
+                "https://github.com/opencart/opencart/releases/download/${OC_VERSION}/opencart-${OC_VERSION}.zip" \
+              && unzip -q /tmp/oc.zip -d /tmp/oc \
+              && UP="$(find /tmp/oc -maxdepth 3 -type d -name upload | head -1)" \
+              && cp -r "$UP"/. /var/www/html/ \
+              && cp /var/www/html/config-dist.php /var/www/html/config.php \
+              && cp /var/www/html/admin/config-dist.php /var/www/html/admin/config.php \
+              && chown -R www-data:www-data /var/www/html \
+              && rm -rf /tmp/oc /tmp/oc.zip
+
+          COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+          RUN chmod +x /usr/local/bin/entrypoint.sh
+          ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+    # Installs OpenCart once (first start only), then hands off to Apache
+    - name: Write OpenCart entrypoint
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/opencart/entrypoint.sh"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -e
+          cd /var/www/html
+          if grep -q "define('DB_HOSTNAME', ''" config.php; then
+            echo "First run: installing OpenCart..."
+            php install/cli_install.php install \
+              --db_hostname db --db_username "$DB_USER" --db_password "$DB_PASS" \
+              --db_database "$DB_NAME" --db_driver mysqli --db_port 3306 \
+              --username "$OC_ADMIN_USER" --password "$OC_ADMIN_PASS" \
+              --email "$OC_ADMIN_EMAIL" --http_server "$OC_URL"
+            rm -rf install
+          fi
+          exec apache2-foreground
+
+    # ---------- BIND9 config ----------
+    - name: Write BIND options
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/bind/named.conf.options"
+        mode: "0644"
+        content: |
+          options {
+              directory "/var/cache/bind";
+              listen-on { any; };
+              // Only private ranges may recurse, so this can't be abused as an open resolver
+              allow-recursion { 127.0.0.1; 10.0.0.0/8; 172.16.0.0/12; 192.168.0.0/16; };
+              allow-transfer { none; };
+              forwarders { 1.1.1.1; 9.9.9.9; };
+              dnssec-validation auto;
+              version "none";
+          };
+
+    - name: Write BIND zone declaration
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/bind/named.conf.local"
+        mode: "0644"
+        content: |
+          zone "{{ domain }}" {
+              type master;
+              file "/etc/bind/zones/db.{{ domain }}";
+          };
+
+    - name: Write BIND zone file
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/bind/zones/db.{{ domain }}"
+        mode: "0644"
+        content: |
+          $TTL 3600
+          @   IN  SOA {{ domain }}. admin.{{ domain }}. (
+                      {{ zone_serial }} ; serial
+                      3600       ; refresh
+                      900        ; retry
+                      604800     ; expire
+                      300 )      ; negative cache TTL
+          @   IN  NS  {{ domain }}.
+          @   IN  A   {{ host_ip }}
+          www IN  A   {{ host_ip }}
+
+    # ---------- Compose ----------
+    - name: Write docker-compose.yml
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/docker-compose.yml"
+        mode: "0600"   # contains passwords
+        content: |
+          services:
+            db:
+              image: mariadb:11
+              restart: unless-stopped
+              environment:
+                MARIADB_ROOT_PASSWORD: "{{ db_root_pass }}"
+                MARIADB_DATABASE: "{{ db_name }}"
+                MARIADB_USER: "{{ db_user }}"
+                MARIADB_PASSWORD: "{{ db_pass }}"
+              volumes:
+                - db_data:/var/lib/mysql
+              healthcheck:
+                test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+                interval: 5s
+                timeout: 5s
+                retries: 20
+
+            opencart:
+              build: ./opencart
+              restart: unless-stopped
+              depends_on:
+                db:
+                  condition: service_healthy
+              environment:
+                DB_NAME: "{{ db_name }}"
+                DB_USER: "{{ db_user }}"
+                DB_PASS: "{{ db_pass }}"
+                OC_URL: "{{ oc_url }}"
+                OC_ADMIN_USER: "{{ oc_admin_user }}"
+                OC_ADMIN_PASS: "{{ oc_admin_pass }}"
+                OC_ADMIN_EMAIL: "{{ oc_admin_email }}"
+              ports:
+                - "{{ oc_port }}:80"
+              volumes:
+                - oc_html:/var/www/html
+
+            bind9:
+              image: ubuntu/bind9:latest
+              restart: unless-stopped
+              ports:
+                - "{{ dns_bind_ip }}:53:53/udp"
+                - "{{ dns_bind_ip }}:53:53/tcp"
+              volumes:
+                - ./bind/named.conf.options:/etc/bind/named.conf.options:ro
+                - ./bind/named.conf.local:/etc/bind/named.conf.local:ro
+                - ./bind/zones:/etc/bind/zones:ro
+
+          volumes:
+            db_data:
+            oc_html:
+
+    - name: Build and start the stack
+      ansible.builtin.command: docker compose up -d --build
+      args:
+        chdir: "{{ stack_dir }}"
+      changed_when: true
+
+    - name: Show how to verify
+      ansible.builtin.debug:
+        msg:
+          - "Shop:  {{ oc_url }}   Admin: {{ oc_url }}admin/"
+          - "DNS:   dig @{{ dns_bind_ip }} www.{{ domain }} +short"
+          - "Logs:  cd {{ stack_dir }} && sudo docker compose logs -f opencart"
